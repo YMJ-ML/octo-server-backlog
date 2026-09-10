@@ -1,0 +1,46 @@
+# AINOL Agent Architecture - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+python-dotenv==1.0.0
+requests==2.31.0
+aiohttp==3.9.1
+
+# AI Platform SDKs
+# Kimi (Moonshot)
+# DeepSeek
+# No official SDK, using requests
+
+# Alibaba Qianwen
+dashscope==1.13.0
+
+# Data processing
+pandas==2.1.3
+numpy==1.26.2
+
+# Utilities
+python-dateutil==2.8.2
+
+# Logging and monitoring
+colorlog==6.8.0
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+
+# Code quality
+black==23.12.0
+flake8==6.1.0
+pylint==3.0.3
+
+# Optional: Redis support (if using Redis cache)
+# redis==5.0.1
+
+# Optional: Database support
+# sqlalchemy==2.0.23
+
+# Optional: API docs generation
+# pydantic==2.5.1
+# fastapi==0.109.0
+# uvicorn==0.27.0
