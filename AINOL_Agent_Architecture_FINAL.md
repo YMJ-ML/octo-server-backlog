@@ -1,250 +1,512 @@
-# octo-server 产品管家 Agent —— 架构设计
+# octo-server 产品管家 Agent —— 架构设计 v5（考试流程优化最终版）
 
-> 本文档定义一套为 octo-server（OCTO 平台 Go 后端）服务的"产品管家"多 Agent 系统。
-> 它承担四类职责：产品问答、反馈归档、需求生命周期管理（PM 链路）、以及向团队群主动同步状态。
-> 系统设计的两大前提：**(1) 只读取 octo-server 源码，不修改目标仓库；(2) 所有周期性工作由 cron 自驱，不依赖人工触发；(3) 三个 bot 各自在群里以自己的名字发言。**
-
----
-
-## 1. 背景与目标
-
-octo-server 是一个 41 个业务模块的 Go 后端，对外提供 REST + WebSocket，承载业务编排、调度 Lobster agent，并作为 WuKongIM 的控制面。我们希望在团队沟通群（Octo 群）里常驻一组 Agent，扮演"产品管家"：
-
-- **随时答产品问题**：基于源码给出可核验的结论，附文件路径与行号。
-- **收口反馈**：把群里的 bug / feature 反馈结构化沉淀到需求池（一个独立的 GitHub 仓库）。
-- **推进需求**：认领 → 写 PRD → 评审 → 按评审意见迭代，形成闭环。
-- **主动同步**：需求池状态发生变化（尤其是外部人员改动）时，主动在群里通报，而不是等人来问。
-
-系统对"主动性"和"可信度"要求很高：扫描必须定时自动发生，引用必须可被任何人核验，输出必须如实反映状态。
+> 适用场景：AINOL 延期考试。  
+> 本版是在 9/10 代码拆分基础上，结合 9/11 与 9/14 讨论结果，对原有 GitHub Backlog + Octo 群通知流程做优化；**不是新建系统**。
 
 ---
 
-## 2. 总体架构
+## 0. 三个核心前提
 
-系统由 **3 个 LLM Agent + 1 个 cron 调度层** 组成。关键决策是：**把"定时唤醒"从 Agent 内部抽离到独立的 cron 层**，Agent 是被动被 cron 调用的"能力单元"。这样即使某次 LLM 调用失败，调度循环依然照常运转，系统不会因为"没人提醒"而停摆。
+1. **目标仓库只读**：`Mininglamp-OSS/octo-server` 只能读取源码，不允许写入。
+2. **Backlog 仓库可写**：考试需求池仓库 `YMJ-ML/octo-server-backlog` 用于 issue、label、评论和流程状态管理。
+3. **Cron 自驱闭环**：Agent 每 5 分钟轮询 GitHub，不依赖人工通知；考官在 GitHub 上打标签、评论、关单、reopen 等操作后，Agent 自动识别并推进下一步。
 
+---
+
+## 1. Agent 角色设计
+
+考试中使用 3 个 Bot/Agent，各自负责清晰边界：
+
+| Agent | 主要职责 | 发言场景 |
+|---|---|---|
+| `octo产品管家` | 轮询 GitHub、识别新 issue、分类、打标签、处理 question、发考试群通知 | 新 issue 认领、问题回答、状态流转通知、异常提醒 |
+| `octo PRD` | 根据 feature/复杂 bug 生成 PRD | 在 issue 评论区输出 PRD 草稿 |
+| `octo Review` | 自审 PRD，判断是否满足规范 | 审核通过/不通过后打标签、评论原因 |
+
+> 群消息必须通过 Octo Bot API 正确构建 `mention.entities`，确保 @ 主考/相关人蓝色高亮。
+
+---
+
+## 2. 标签体系（最终版）
+
+### 2.1 类型标签
+
+| 标签 | 含义 | 谁打 |
+|---|---|---|
+| `type/feature` | 功能需求 / 产品需求 | Agent 自动打，考官可改 |
+| `type/bug` | 缺陷 / 异常 / 故障 | Agent 自动打，考官可改 |
+| `type/question` | 产品/代码/流程问答 | Agent 自动打，考官可改 |
+
+### 2.2 优先级标签
+
+| 标签 | 含义 | 触发逻辑 |
+|---|---|---|
+| `priority/P0` | 紧急/阻塞/严重事故 | 标题或正文含 urgent、critical、宕机、阻塞、严重等 |
+| `priority/P1` | 高优 | 重要、尽快、高优等 |
+| `priority/P2` | 默认中优 | 默认值 |
+| `priority/P3` | 低优 | 明确低优/可排期 |
+
+> 如仓库里已存在 `P0/P1/P2` 旧标签，代码可兼容读取；最终架构建议统一为 `priority/P0-P3`。
+
+### 2.3 模块标签
+
+| 标签格式 | 含义 |
+|---|---|
+| `module/bot` | Bot / Agent / app_bot / botfather 相关 |
+| `module/api` | Bot API / HTTP API / 错误码相关 |
+| `module/auth` | token、cookie、鉴权、权限相关 |
+| `module/im` | WuKongIM、消息通道、IM 控制面相关 |
+| `module/config` | 配置、部署、环境变量相关 |
+| `module/storage` | 数据库、Redis、对象存储相关 |
+| `module/build` | 构建、发布、Docker、Makefile 相关 |
+| `module/unknown` | 无法稳定判断模块 |
+
+### 2.4 流程状态标签
+
+| 标签 | 含义 | 使用场景 |
+|---|---|---|
+| `confirmed` | 已确认是有效 bug/需求 | bug 分支初始确认 |
+| `queue/simple` | 简单 bug，排队修复 | 简单 bug 不走 PRD |
+| `prd/draft` | PRD 草稿已生成 | PRD Agent 输出后 |
+| `prd/reviewed` | PRD 已通过 AI 自审 | Review Agent 审核通过 |
+| `revising` | 正在根据退回意见修改 | 考官打回后 |
+| `designed` | 考官确认设计通过 | 考官决策标签 |
+| `in_progress` | 已进入开发/修复阶段 | designed 后进入执行阶段 |
+| `done` | 已完成，待验收或已验收 | 开发完成/关单前后 |
+| `answered` | question 已回答 | 问答分支 |
+| `duplicate` | 重复 issue | 考官决策标签 |
+| `wontfix` | 不处理/不修复 | 考官决策标签 |
+
+### 2.5 打回标签
+
+| 标签 | 含义 |
+|---|---|
+| `rejected/结构不完整` | PRD 七板块缺失 |
+| `rejected/包含实现细节` | 写了 How，不符合 What not How |
+| `rejected/验收标准不可测` | 验收标准不是用户可感知结果 |
+| `rejected/逻辑矛盾` | 背景、目标、验收标准之间矛盾 |
+| `rejected/模块错误` | 涉及模块与知识库不一致 |
+| `rejected/自定义原因` | 考官自定义打回原因 |
+
+> 已废弃：`needs-analysis`。新 issue 不再进入“待分析”状态，而是由 Agent 自动分类并立即进入对应分支。
+
+---
+
+## 3. 整体流程图
+
+```text
+新 Issue 创建
+  ↓
+Cron 轮询发现新 issue
+  ↓
+octo产品管家自动分类：type + priority + module
+  ↓
+按 type 分三条分支
+
+┌──────────────────────┬──────────────────────┬──────────────────────┐
+│ type/feature          │ type/bug              │ type/question         │
+│ 功能/需求              │ 缺陷/异常              │ 问答                  │
+├──────────────────────┼──────────────────────┼──────────────────────┤
+│ 自动生成 PRD           │ confirmed             │ 查知识库/源码回答       │
+│ PRD 自审               │ 判断简单/复杂           │ 评论区存档             │
+│ 通过后等考官 designed  │ 简单：queue/simple     │ 考试群自然语言回答       │
+│ designed→in_progress  │ 复杂：转 feature PRD   │ answered              │
+│ done/close 完成通知    │ done/close 完成通知     │ 确认/超时/转需求或bug    │
+└──────────────────────┴──────────────────────┴──────────────────────┘
 ```
- ┌─────────────────────────────────────┐
- │ Octo 群（团队 / 你 / 你的 Bots）     │
- └───┬───────────────┬───────────────┬───┘
-     │ 问答/建单/状态通报 │ │ │ 评审结论
- ┌───────▼──────┐ ┌──────▼──────┐ ┌──────▼──────┐
- │ octo产品管家 │ │ octo PRD   │ │ octo Review │
- │ A1:问答+收单 │ │ A2:PRD撰写 │ │ A3:评审     │
- │ +回报群     │ │ /改稿      │ │             │
- └───────┬──────┘ └──────┬──────┘ └──────┬──────┘
-         │ 认领→写PRD      │ 评审↔打回理由 │
-         └────────┬──────┴──────┬────────┘
-                  │ 读写 issue │ 读 events
-         ┌────▼───────────────▼──────────┐
-         │ 需求池仓库（独立 public repo） │◄── 唯一真相源 + 事件总线
-         └────────────────────────────────┘
-              ▲ 外部人员在此改动（关单/wontfix/打label）
- ┌────────────┴────────────────────────────┐
- │ (K) Cron 调度层（系统级，非 LLM）       │
- │ • run_sync.py（每 5 分钟）              │
- │   → 增量同步需求池 + 检测外部变更      │
- │ • run_pm.py（每 15 分钟或事件触发）    │
- │   → 推进 PM 链路（认领→PRD→评审）    │
- │ • 事件快路径（近实时）                  │
- │   → 整条链路任何 bot 写回后即时触发    │
- └─────────────────────────────────────────┘
 
-（octo产品管家 答产品问题只读本地 octo-server 代码副本，不碰 GitHub 目标仓库）
+---
+
+## 4. 分支流程设计
+
+## 4.1 新 issue 统一入口
+
+### 触发条件
+
+GitHub Backlog 仓库出现新 issue。
+
+### Agent 动作
+
+1. 读取 issue 标题、正文、已有标签。
+2. 自动判断：
+   - `type/feature` / `type/bug` / `type/question`
+   - `priority/P0-P3`
+   - `module/xxx`
+3. 给 issue 打上分类标签。
+4. 在 issue 评论区写认领评论，说明已进入哪条流程。
+5. 默认**不在考试群通知**，避免新 issue 太多刷屏；但 `priority/P0` 必须考试群提醒。
+
+---
+
+## 4.2 Feature / 需求分支
+
+### 流程
+
+```text
+type/feature
+  ↓
+octo PRD 自动生成 PRD
+  ↓
+打 prd/draft，评论 PRD 内容
+  ↓
+octo Review 自审
+  ↓
+通过：打 prd/reviewed，考试群 @主考 审核
+不通过：打 rejected/xxx + revising，自动修改后再次自审（无限循环，不设次数上限）
+  ↓
+考官审核
+  ↓
+通过：考官打 designed
+  ↓
+Agent 自动进入 in_progress，并考试群通知进入开发/排期
+  ↓
+开发完成：打 done 或关单
+  ↓
+Agent 考试群通知完成/验收结果
+```
+
+### PRD 规范：只写 What，不写 How
+
+PRD 必须包含 7 个板块：
+
+1. 需求背景
+2. 用户场景
+3. 需求目标
+4. 验收标准
+5. 优先级
+6. 涉及模块
+7. 补充说明
+
+### 验收标准要求
+
+验收标准必须是**用户可感知结果**，不能写成技术实现细节。
+
+错误示例：
+- “接口返回 200”
+- “数据库字段成功更新”
+- “调用某某函数”
+
+正确示例：
+- “用户发送消息后，能在 3 秒内看到机器人回复”
+- “当 token 失效时，页面提示用户重新登录”
+
+---
+
+## 4.3 Bug 分支
+
+### 流程
+
+```text
+type/bug
+  ↓
+Agent 打 confirmed
+  ↓
+判断复杂度
+  ↓
+简单 bug：打 queue/simple，进入修复队列，可后续打 in_progress/done
+复杂 bug：转 type/feature，进入 PRD 分支
+```
+
+### 简单 bug 判断
+
+满足以下情况之一，可视为简单 bug：
+
+- 文案错误
+- 配置缺失
+- 明确的小范围异常
+- 不涉及产品流程改动
+- 不需要重新定义用户体验或验收逻辑
+
+### 复杂 bug 判断
+
+满足以下情况之一，转 feature/PRD：
+
+- 涉及用户路径变化
+- 涉及权限、消息链路、Bot 身份等核心机制
+- 需要设计新的交互规则
+- 影响范围不清，需要先定义验收标准
+
+---
+
+## 4.4 Question / 问答分支
+
+### 流程
+
+```text
+type/question
+  ↓
+Agent 查询知识库 + 必要时读取 octo-server 源码
+  ↓
+生成自然语言回答
+  ↓
+评论区存档完整回答（含来源路径+行号）
+  ↓
+考试群直接自然语言回答问题，不固定格式
+  ↓
+打 answered
+  ↓
+等待用户/考官确认
+  ├─ 确认已解决：可关单/打 done
+  ├─ 不满意：继续补充回答
+  ├─ 发现是 bug：转 type/bug
+  └─ 发现是需求：转 type/feature
+```
+
+### 群消息格式原则
+
+不固定模板，自然语言说清楚即可，但必须做到：
+
+- 直接回答问题，不只说“去 issue 看评论”
+- 必要时给出核心依据
+- 长内容放评论区，群里给摘要和结论
+- 如引用源码结论，必须带路径和行号
+
+示例：
+
+```text
+@主考 这个问题我查到了：octo-server 的 Bot API 鉴权主要在 xxx.go 里处理，核心判断是 token 前缀和 bot 身份绑定。结论是：普通用户 token 不能直接走 bot send API，需要 bot token。
+
+我已把完整依据和源码路径补到 #12 评论区，方便验收。
 ```
 
 ---
 
-## 3. 三个 Agent 的职责边界
+## 5. 考官操作响应规则
 
-| Bot | 名字 | 在群里发言？ | 核心职责 | 触发方式 |
-| ------ | ------------- | ------ | ----------------------------------------------------------------- | ------------------- |
-| **A1** | `octo产品管家` | ✅ 自己发 | ① 答产品问题（带引用）② 收反馈 → 建 issue + 打 label + @相关人 ③ 把 cron 检测到的外部变更回报群 | 被 @/被提问；被 cron 触发回报 |
-| **A2** | `octo PRD` | ✅ 自己发 | 认领需求 → 补成 PRD（只写 What）→ 按评审打回的结构化理由改稿；PRD 进展自己同步群 | 被 cron 或事件快路径调用 |
-| **A3** | `octo Review` | ✅ 自己发 | 对"待评审"单做 review → 通过 / 打回 + 结构化理由；评审结论自己同步群 | 被 cron 或事件快路径调用 |
-
-**为什么三个 bot 各自发言**：每个 bot 只拥有自己领域的"嗓门"，责任边界清晰、上下文自洽——octo PRD 发的就是 PRD 进展，octo Review 发的就是评审结论，不依赖中转、不丢信息；cron 直接驱动各自发言，统一遵守"无产出不发言"的纪律即可，反而比单一门面更容易追责。
-
-**A2 × A3 协作**：octo PRD 写 PRD、octo Review 评审、打回后 octo PRD 改稿，这条闭环是系统自动推进需求的核心，也是双 Agent 协作的体现。
+| 考官操作 | Agent 检测方式 | Agent 动作 |
+|---|---|---|
+| 打 `designed` | GitHub Issue Events `labeled` | 视为 PRD 通过，进入 `in_progress`，考试群通知 |
+| 打 `rejected/xxx` + 评论意见 | Events + Comments API | 读取最新评论，进入 `revising`，修改 PRD 后重新自审；无限循环 |
+| 直接 close，且有 `designed`/`done` | Events `closed` | 视为验收完成，打/确认 `done`，考试群通知 |
+| close + `wontfix` | Events `closed/labeled` + Comments | 通知不处理原因；若无原因，群里提醒考官补充 |
+| 打 `duplicate` + 评论 `#xxx` | Events + Comments | 通知重复 issue；若无重复编号，提醒补充 |
+| 修改 type/priority/module | Events `labeled/unlabeled` | 按新标签重新进入对应流程；P0 变更立即群提醒 |
+| reopen | Events `reopened` | 根据当前标签恢复到对应阶段，并考试群通知 |
+| 打 `in_progress` | Events `labeled` | 记录进入开发/修复阶段，必要时群通知 |
+| 打 `done` | Events `labeled` | 记录完成，提醒等待验收或关闭 issue |
 
 ---
 
-## 4. 调度层：cron 驱动的定期自动扫描（系统核心）
+## 6. 轮询技术方案
 
-> 设计原则：**扫描由 cron 定时触发，不依赖任何人工指令。** 没有任何"去扫一下"的按钮或命令是人的必经动作——cron 自己醒。
+现有旧方案是“全量 issue 快照对比”，问题是：
 
-### 4.1 Cron 任务定义
+1. 读不到评论内容。
+2. closed issue 只看最近 10 分钟，宕机超过 10 分钟可能漏事件。
+3. 无法区分是考官操作还是 Bot 自己操作，容易自己触发自己。
+
+### 新方案：事件游标 + 评论游标
+
+```text
+Cron 每 5 分钟运行
+  ↓
+GET /issues?state=all&since=上次轮询时间-1min
+  ↓
+找出更新过的 issue
+  ↓
+对每个 issue 拉取：
+  - /issues/{n}/events     # 标签、关单、reopen 等事件
+  - /issues/{n}/comments   # 新增评论正文
+  ↓
+根据 event.id / comment.id 增量处理
+  ↓
+保存本地状态，避免重复处理
+```
+
+### 需要使用的 GitHub API
+
+| API | 用途 |
+|---|---|
+| `GET /repos/{owner}/{repo}/issues?state=all&since=...` | 发现最近更新的 issue |
+| `GET /repos/{owner}/{repo}/issues/{issue_number}/events` | 读取 labeled/unlabeled/closed/reopened/assigned 等事件 |
+| `GET /repos/{owner}/{repo}/issues/{issue_number}/comments` | 读取考官评论、打回原因、wontfix 原因、question 追问 |
+| 可选：`GET /repos/{owner}/{repo}/issues/{issue_number}/timeline` | 如果需要统一读取评论+事件时间线，可替代 events+comments 组合 |
+
+### 本地状态文件
+
+`issue_state.json` 建议结构：
+
+```json
+{
+  "last_poll_at": "2026-09-14T14:30:00Z",
+  "issues": {
+    "12": {
+      "last_event_id": 123456,
+      "last_comment_id": 78910,
+      "labels": ["type/feature", "priority/P2", "prd/reviewed"],
+      "state": "open",
+      "stage": "waiting_examiner_review",
+      "updated_at": "2026-09-14T14:28:00Z"
+    }
+  }
+}
+```
+
+### 防重复和防死循环
+
+1. 记录 `last_event_id`，只处理新事件。
+2. 记录 `last_comment_id`，只处理新评论。
+3. 通过 `actor.login` 或 `actor.id` 判断事件发起人。
+4. 如果事件是 3 个 Bot 自己产生的，默认跳过，避免“自己打标签 → 自己触发自己”。
+5. 对必须响应的 Bot 内部事件，用显式 stage 控制，而不是靠再次检测标签触发。
+
+---
+
+## 7. 通知策略
+
+### 7.1 通知渠道
+
+考试场景下，所有需要人的通知都发到**考试群**，不单独建开发群。
+
+### 7.2 通知核心原则（9/14 老大确认）
+
+**扫到变化必须主动回群说，不等待人来查。**
+
+每条群通知必须满足：
+1. **说清楚发生了什么**：哪个issue编号、什么变化、当前流转到哪个状态
+2. **@ 对应当事人**：提issue的人是需求/问题/defect的发起人，永远@；考官操作引起变化则也@考官
+3. **始终 @ 主考**：所有通知都要@主考抄送知情
+4. 群消息用自然语言简洁表达，不固定模板；详细内容（PRD全文、源码引用、回答依据）在issue评论区存档
+
+### 7.3 Issue 评论区与考试群分工
+
+| 渠道 | 用途 |
+|---|---|
+| Issue 评论区 | 官方存档：PRD全文、回答依据、打回修改记录、源码路径行号、状态说明 |
+| 考试群 | **所有流程变化主动通知**：简洁说明+@当事人+@主考 |
+
+### 7.4 发群消息场景（所有变化全发，@当事人+@主考）
+
+| 场景 | @谁 |
+|---|---|
+| 新 issue 自动分类完成（含type/priority/module识别结果） | @提issue的人 + @主考 |
+| P0 新 issue（高优先级提示） | @提issue的人 + @主考 |
+| question 回答完成（自然语言答+评论区已存依据） | @提issue的人 + @主考 |
+| PRD 草稿生成完成 | @主考 |
+| PRD 自审通过、提交考官审核 | @主考 |
+| PRD 自审不通过、自动进入修改 | @主考 |
+| 考官打 rejected、AI读取意见修改中 | @主考（说明打回原因） |
+| 修改后重新自审通过、再次提交审核 | @主考 |
+| 考官打 designed → 进入 in_progress | @提issue的人 + @主考 |
+| bug 确认confirmed、判为简单bug→queue/simple | @提issue的人 + @主考 |
+| bug 判为复杂→转type/feature走PRD流程 | @提issue的人 + @主考 |
+| in_progress → done 开发完成、待验收 | @提issue的人 + @主考 |
+| done / close 验收完成关闭 | @提issue的人 + @主考 |
+| wontfix 拒绝关闭（附原因） | @提issue的人 + @主考 |
+| duplicate 重复关闭（附重复编号#xxx） | @提issue的人 + @主考 |
+| 缺少必要信息（wontfix没写原因/duplicate没编号）——催考官补充 | @操作考官 + @主考 |
+| 考官改type/priority/module → 按新标签重走流程 | @提issue的人 + @主考 |
+| P0变更紧急调整 | @提issue的人 + @主考（加🔴紧急标识） |
+| Reopen 恢复流程 | @操作人 + @主考 |
+| question 用户确认OK/超时7天自动关单 | @提issue的人 + @主考 |
+| question 追问/不满意继续回答 | @提issue的人 + @主考 |
+| question 发现是bug/feature → 转对应流程 | @提issue的人 + @主考 |
+| API 限流/鉴权失败/轮询异常 | @主考（加⚠️异常标识） |
+| Bot 自身打回修改循环次数过多（如超过5轮）需要人工介入 | @主考 |
+
+---
+
+## 8. 文件结构
+
+```text
+AINOL_Backlog/
+├── octo_bot.py                  # Octo消息工具，负责群消息和@高亮
+├── poll_issues.py               # GitHub轮询、event/comment游标、事件分发
+├── pm_actions.py                # 业务流程处理：feature/bug/question/考官操作
+├── run_pm_octo.py               # 可选整合入口/考试运行入口
+├── ainol_compliance.py          # 红线/合规检查
+├── AINOL_Knowledge_Base_9_Domains.md
+├── AINOL_Knowledge_Base_9_Domains_V2.md
+├── AINOL_Agent_Architecture_FINAL.md
+├── README_EXAM.md
+├── config.env.example
+├── requirements.txt
+├── issue_state.json             # 自动生成，本地状态游标
+└── logs/                        # 自动生成，轮询和动作日志
+```
+
+---
+
+## 9. 运行方式
+
+```bash
+cd AINOL_Backlog
+pip install -r requirements.txt
+cp config.env.example config.env
+# 填入 GITHUB_TOKEN、考试群ID、主考UID等
+python3 poll_issues.py --once
+python3 poll_issues.py
+```
+
+### Cron 示例
 
 ```cron
-# 每 5 分钟：增量同步需求池 + 检测外部变更并回报群
-*/5 * * * * root . ${AGENT_HOME}/config.env; /usr/bin/python3 ${AGENT_HOME}/scripts/run_sync.py >> ${AGENT_HOME}/logs/sync.log 2>&1
-
-# 每 15 分钟：推进 PM 链路（认领 → 补PRD → 评审 → 按理由改稿）
-*/15 * * * * root . ${AGENT_HOME}/config.env; /usr/bin/python3 ${AGENT_HOME}/scripts/run_pm.py >> ${AGENT_HOME}/logs/pm.log 2>&1
+*/5 * * * * cd /path/to/AINOL_Backlog && python3 poll_issues.py >> logs/poll.log 2>&1
 ```
 
-其中 `${AGENT_HOME}` 为你的实际工作目录（如 `~/octo-server-backlog`）。
-
-脚本是**薄调度层**：只读拉状态、选 issue、调 agent；GitHub 写入与群消息都由 agent 运行时完成。
-
-### 4.2 `run_sync.py`（每 5 分钟）—— 外部变更感知
-
-1. 用 GitHub REST `issues` 只读拉取需求池全部 issue（**只用 REST list，不用 Search API**，避开 30 次/分钟的限流，且本场景不需要全文检索）。
-2. 与本地 `state.json` 里的"上一次快照"做 diff，只关注真实变化：issue 被 `closed`、被 `closed as wontfix`、label 增删、指派给非 bot 的人等。
-3. 若发现变化 → 调用 **octo产品管家**，按变化类型在群里通报（@主考 + @相关人），如实描述变更（"X 已将 #12 关为 wontfix"，而非"已处理"）。
-4. 若无变化 → **只写日志，不发任何群消息**（"正在检查""本次无更新""一切正常"这类过程消息一律不发）。
-5. 无论有无变化，向 `EXECUTION_LOG.md` 追加一行运行记录（时间戳、扫到条目数、是否空跑、做了什么）。
-
-### 4.3 `run_pm.py`（每 15 分钟或事件快路径）—— PM 链路推进
-
-设计为**幂等且可聚焦单号**：`run_pm.py` 或 `run_pm.py --issue=<n>`
-
-**按状态逐步推进**：
-1. 拉取当前处于 `triage` 的 issue → 交 A2 认领并置 `accepted`。
-2. 拉取 `accepted` 但无 PRD 的 issue → 交 A2 补 PRD（只写 What），置 `prd`，再置 `review` 并显式指派 reviewer。
-3. 拉取 `review` 的 issue → 交 A3 评审：通过置 `approved`→`done`；打回则输出**结构化理由**并置 `rejected/<原因>`。
-4. 拉取 `rejected/*` 的 issue → 交 A2 按结构化理由改稿，回到 `prd`→`review`。
-5. 本轮若有状态推进，**octo PRD / octo Review 各自就自己负责的单子在群里同步摘要**（octo PRD 报 PRD 进展与改稿，octo Review 报评审结论）；空跑只留日志。
-
-### 4.4 事件快路径（近实时接管，贯穿整条 PM 链路）
-
-**关键设计**：`run_pm.py` 支持 `--issue=<n>` 只聚焦单条，且幂等、按状态推进该单当前能走的所有步。因此 PM 链路里**任何一步 bot 写回状态后，都由该 bot 的运行时代码再执行一次 `run_pm.py --issue=<n>` 推进下一环**，形成链式近实时闭环：
-
-- **octo产品管家 建单**（`triage` #N）→ 运行时代码执行 `run_pm.py --issue=N` → A2 秒级认领
-- **octo PRD 写完 PRD 置 `review`** 并指派 A3 → 运行时代码执行 `run_pm.py --issue=N` → A3 秒级评审
-- **octo Review 打回置 `rejected/<原因>`** → 运行时代码执行 `run_pm.py --issue=N` → A2 秒级改稿
-
-**接线方式**（推荐方案 A）：在每个 bot 的"写回状态"动作之后，由该 bot 的运行时代码直接 `subprocess` 调用 `python3 ${AGENT_HOME}/scripts/run_pm.py --issue=N`。
-
-**Cron 保底**：cron 每 15 分钟运行一次 `run_pm.py`（无参数），处理所有待处理 issue。这样即使事件丢失，下一轮 cron 仍会接管。
-
-> **配置说明**：
-> - `${AGENT_HOME}` = 你的工作目录（如 `~/octo-server-backlog`）
-> - `.env` 配置文件包含所有 token 和 ID（见 `config.env.example`）
-> - `scripts/` 子目录放 Python 脚本
-> - `logs/` 子目录放执行日志
-
-**结果**：A2、A3 不再只能等 15 分钟 cron，而是被事件即时唤醒；整条 PM 链路除"第一跳"外均可秒级接管。注意：事件触发由 Agent 运行时自动发起，**不是人喊"去扫"**，不违反"cron 自驱"要求；cron 仍独立运行，作为任何一跳事件丢失时的兜底。
-
-### 4.5 为什么这样稳
-
-- **唤醒与推理解耦**：cron 是系统级定时器，LLM 超时/报错不影响下一轮准时唤醒。
-- **空跑静默**：无变化时不产生任何群消息，符合"无产出不发言"的输出纪律。
-- **自证在跑**：`EXECUTION_LOG.md` 常驻于需求池仓库，任何人都可随时查看最近若干次定时执行记录。
-
 ---
 
-## 5. 需求池仓库：唯一真相源 + 事件总线
+## 10. 配置项
 
-独立的 public GitHub 仓库同时承担三件事：反馈归档、需求生命周期状态机、外部变更入口。
+```env
+GITHUB_TOKEN=xxx
+BACKLOG_REPO=YMJ-ML/octo-server-backlog
+SOURCE_REPO=Mininglamp-OSS/octo-server
+POLL_INTERVAL=300
+STATE_FILE=issue_state.json
 
-### 5.1 Label 体系（三类齐全）
+EXAM_GROUP_ID=xxx
+EXAMINER_UID=xxx
 
-| 类别 | Label 示例 | 含义 |
-| --- | -------------------------------------------------------------------------------------------------------- | ---------------- |
-| 类型 | `type/bug` `type/feature` `type/question` | 反馈是缺陷 / 需求 / 纯问答 |
-| 优先级 | `P0` `P1` `P2` | 越高越急 |
-| 状态 | `triage`(待分诊) `accepted`(已认领) `prd`(已有PRD) `review`(待评审) `approved` `rejected/<原因>`(打回) `wontfix` `done` | 生命周期阶段 |
+BOT_PRODUCT_ACCOUNT=octo_product_manager
+BOT_PRD_ACCOUNT=octo_prd
+BOT_REVIEW_ACCOUNT=octo_review
 
-### 5.2 Issue 状态机（对应 PM 链路）
-
-```
-反馈进池 → triage → accepted(认领) → prd(补PRD) → review(找人review)
- ├─ approved(通过) ──→ done
- └─ rejected/<原因>(按理由改) ──→ prd(改稿) ──→ review ...
-外部可随时: closed / closed as wontfix(→ wontfix label)
+QUESTION_AUTO_CLOSE_DAYS=7
 ```
 
-**PM 链路 4 步 → 状态机映射**：① 认领=`accepted`；② 补PRD=`prd`；③ 找人review=`review`（置此态时**显式指派 reviewer**：默认 A3）；④ 按打回改=`rejected/<原因> → prd`。
+---
 
-**打回硬约束**：A3 打回必须输出**结构化理由**（如 `rejected/验收标准不可测`、`rejected/缺用户场景`），A2 才能确定性地对症改稿，而非 LLM 猜测。自然语言打回视为无效、循环回 A3 重打。
+## 11. 红线遵守
 
-### 5.3 持久化与可观测性
-
-**`state.json`** — 需求池每个 issue 的上一次快照（label、open/closed、assignee），供 cron 做增量 diff。
-
-**`EXECUTION_LOG.md`** — 每次 cron 运行追加一行：时间、扫到条目数、是否空跑、执行的动作。这是"系统确实在定时自驱"的直接证据，也便于排查哪一轮漏处理了什么。
+| 红线 | 设计保证 |
+|---|---|
+| 目标仓库只读 | 代码层面对 `SOURCE_REPO` 只允许 GET，不允许 POST/PATCH/DELETE |
+| 凭证不进群、不进 git | token 只放本地 `config.env`，`.gitignore` 排除 |
+| 不编造代码引用 | 知识库结论必须带真实源码路径+行号；不确定就说明不确定 |
+| 冻结后不改 Agent | 考试前确定冻结时间，冻结后只运行不改逻辑 |
+| GitHub 限流撞到就停 | 检查 rate limit，低于阈值暂停并提醒 |
+| 不做虚假演示 | 所有动作真实写 GitHub issue / label / comment，并发考试群 |
 
 ---
 
-## 6. 本地只读代码副本（关键设计）
+## 12. 当前待改代码点
 
-### 6.1 为什么必须本地只读副本
+基于本架构，现有代码需要从旧版 4 事件模型升级为新版流程：
 
-1. **行号引用要精确高频** — 结论格式 `来源: <路径>#L<起>-L<止>`，常需跨文件精读，本地毫秒级无限次；远程 API 不耐。
-2. **引用预核验** — 路径存在/行号在区间/文本支撑结论，只能基于本地文件系统。
-3. **目标仓库只读红线** — clone 到本地只读目录物理保证"读遍源码却不写回"。
-4. **README 不可信** — git checkout 锁定版本，问答可复现可追责。
-5. **规避限流** — GitHub Search 30/分、REST 5000/小时；本地零成本零限流。
-6. **稳定性** — 不依赖外部网络，考试运行时稳定。
-7. **安全** — clone 公开仓库，工具调用无需 token 进 prompt。
+1. `poll_issues.py`
+   - 从快照对比改为 event/comment 游标。
+   - 支持 `labeled/unlabeled/closed/reopened/commented` 等事件。
+   - 加入 actor 过滤，避免 Bot 自触发。
 
-### 6.2 技术可行性确认 ✅
+2. `pm_actions.py`
+   - 增加 feature/bug/question 三分支处理。
+   - 增加 PRD 自审、rejected→revising→重写循环。
+   - 增加 designed→in_progress→done 流程。
+   - 增加 wontfix/duplicate/reopen/改标签处理。
 
-- octo-server 源码已在本地（1761 个 Go 文件）
-- 本地可稳定读取、grep、提取行号
-- 预核验脚本可确认路径+行号真实存在
-- Agent 只做**按需检索/读取**，不全量灌进上下文
+3. `octo_bot.py`
+   - 保留 @ 高亮能力。
+   - 增加 question 自然语言群答复。
+   - 所有人类通知统一发考试群。
 
----
-
-## 7. 群内消息与输出硬约束
-
-1. **@主考必带** — 每一条群消息无条件 @主考，不因"只是顺带同步"而省略。
-2. **相关人必带** — 涉及具体需求/变更时额外 @相关人。
-3. **无变化不发言** — 没有检测到变更、没有要转述的结论，只进日志。
-4. **如实转述** — 已修复 ≠ 未复现 ≠ 不做（wontfix），用 label 精确表达。
-5. **答不上来就认** — 知识库没有的结论，回"我不确定" + 指出该找谁 + 说明要补哪块知识。禁止猜测。
-6. **凭证不出门** — token 只在服务端配置，绝不进群、绝不进 git。
+4. `README_EXAM.md`
+   - 更新最终标签体系、运行方式、红线说明、考试当天检查清单。
 
 ---
 
-## 8. 引用核验机制
+## 13. 一句话总结
 
-- A1 答产品问题前用脚本验证：路径相对仓库根存在、行号区间在文件范围内、该段文本确实支撑结论。
-- 核验不过的结论不允许发出 — **从机制上杜绝编造引用**。
-- 每条结论格式：`来源: modules/bot_api/bot_api.go#L30-L50`
+本版架构的核心是：
 
----
-
-## 9. 打回结构化硬约束
-
-- A3 打回必须输出**结构化理由**，如 `rejected/验收标准不可测`、`rejected/缺用户场景`。
-- 自然语言打回视为无效，循环回 A3 重打。
-- A2 能确定性对症改稿，不是 LLM 猜测。
-
----
-
-## 10. 安全与可靠性约束
-
-| 约束 | 架构上的保证 |
-| ------------ | ------------------------------------------------------------------------------- |
-| 目标仓库只读 | Agent 只 clone/读文件，对 octo-server 仅读；写操作只针对需求池 repo |
-| 凭证不出门/不进 git | token 走环境变量 / 密钥管理；`.gitignore` 排除配置 |
-| 不编造引用 | 第 8 节"引用预核验"前置拦截 |
-| 限流 | cron 只用 REST list/events（不用 Search）；5 分钟一轮约 288 次/天，远低于 REST 5000/小时 |
-| 状态可恢复 | `state.json` + `EXECUTION_LOG.md` 持久化，重启后可续 |
-
----
-
-## 11. 部署与集成
-
-- **平台**：任意能稳定跑常驻 cron 与 LLM 调用的环境。
-- **群集成**：三个 bot 各自持有群身份，分别以自己名字发言。
-- **代码副本**：`main` 分支浅克隆到本地只读目录，供 A1 引用与核验。
-- **Cron 宿主**：独立进程/机器，即使 Agent 进程重启，cron 依然按表触发。
-
----
-
-## 12. 关键设计决策与理由
-
-1. **调度与 LLM 解耦**：把"定时唤醒"做成系统级 cron，保证"没人提醒也会自己醒"。
-2. **引用预核验**：答产品问题前用脚本验证路径+行号，从机制上杜绝引用造假。
-3. **需求池即事件总线**：把 issue 状态机、外部变更入口、执行日志压进同一仓库。
-4. **各 bot 自发言**：每个 bot 只发自己领域的内容，责任边界清晰。
-5. **打回结构化**：评审意见机器可消费，使"按打回原因改"成为确定性流程。
-6. **事件快路径贯穿全链路**：不再有"等待 15 分钟"的瓶颈，整条 PM 链路秒级自驱。
-
----
-
-**架构设计完成！** 🚀
+> GitHub issue 是流程状态机，Octo 考试群是人类通知面；Agent 用 5 分钟轮询 + event/comment 游标稳定捕捉考官操作，按 feature/bug/question 三分支自动推进 PRD、问答、修复和验收闭环。
