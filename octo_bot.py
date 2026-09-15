@@ -9,6 +9,7 @@ import time
 import subprocess
 import tempfile
 import requests
+from pathlib import Path
 def _load_env_files():
     """兼容加载 .env 和 config.env；即使没装python-dotenv也能读简单KEY=VALUE。"""
     try:
@@ -36,27 +37,36 @@ _load_env_files()
 # ==================== 配置读取 ====================
 
 def _get_bot_token(bot_key):
-    """从OpenClaw配置或环境变量获取bot token"""
+    """从OpenClaw配置文件读取bot token"""
     candidates = [bot_key]
-    # 自动补全_bot后缀或去掉_bot后缀
     if not bot_key.endswith('_bot'):
         candidates.append(bot_key + '_bot')
     else:
         candidates.append(bot_key.replace('_bot', ''))
-    for account in candidates:
+
+    # 直接读openclaw.json配置文件（openclaw config get 会脱敏）
+    config_paths = [
+        Path.home() / '.openclaw' / 'openclaw.json',
+        Path('/home/mlclaw/.openclaw/openclaw.json'),
+    ]
+    for config_path in config_paths:
         try:
-            r = subprocess.run(
-                ['openclaw', 'config', 'get', f'channels.octo.accounts.{account}.botToken'],
-                capture_output=True, text=True, timeout=5
-            )
-            token = r.stdout.strip().strip('"')
-            if token and len(token) > 20:
-                return token
-        except:
+            if config_path.exists():
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                accounts = cfg.get('channels',{}).get('octo',{}).get('accounts',{})
+                for account in candidates:
+                    acc = accounts.get(account)
+                    if acc:
+                        token = acc.get('botToken','')
+                        if token and len(token) > 20 and not token.startswith('__OPENCLAW'):
+                            return token
+        except Exception as e:
             pass
+
     # fallback环境变量
-    env_key = bot_key.upper().replace('-', '_') + '_TOKEN'
-    return os.getenv(env_key, os.getenv('OCTO_BOT_TOKEN', ''))
+    env_key = bot_key.upper().replace('-','_') + '_TOKEN'
+    return os.getenv(env_key, os.getenv('OCTO_BOT_TOKEN',''))
 
 
 def _get_api_url():

@@ -5,6 +5,7 @@ pm_actions.py - AINOL PM流程动作处理（v5版）
 """
 import os
 import re
+from pathlib import Path
 def _load_env_files():
     """兼容加载 .env 和 config.env；即使没装python-dotenv也能读简单KEY=VALUE。"""
     try:
@@ -28,6 +29,14 @@ def _load_env_files():
             os.environ.setdefault(k, v)
 
 _load_env_files()
+
+from poll_issues import IssueClassifier
+from octo_bot import (
+    BOT_PRODUCT, BOT_PRD, BOT_REVIEW,
+    notify_exam_group,
+    github_add_labels, github_remove_label, github_add_comment, github_close_issue,
+    github_get_issue, github_get_comments_since
+)
 
 # ==================== 常量 ====================
 

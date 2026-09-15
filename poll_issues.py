@@ -291,7 +291,9 @@ def get_issue_comments(issue_number):
 # ==================== 事件识别 ====================
 
 def _is_bot_actor(event):
-    """判断事件是否Bot自己产生的"""
+    """判断事件是否Bot自己产生的。
+    正式考试中Bot使用独立GitHub账号/token，考官使用自己的账号，靠actor.login区分。
+    """
     actor = event.get('actor') or {}
     login = (actor.get('login') or '').lower()
     for bot_login in BOT_GITHUB_LOGINS:
@@ -300,8 +302,19 @@ def _is_bot_actor(event):
     return False
 
 
+BOT_SIGNATURES = ['_AINOL octo产品管家_', '_AINOL octo PRD_', '_AINOL octo Review_']
+
+
 def _is_bot_comment(comment):
-    """判断评论是否Bot自己发的"""
+    """判断评论是否Bot自己发的。
+    优先靠评论正文签名（_AINOL octo产品管家_等）判断，
+    同时兼容靠login判断（正式考试Bot账号独立时）。
+    双保险：签名优先，确保即使共用token也能区分。
+    """
+    body = comment.get('body', '') or ''
+    for sig in BOT_SIGNATURES:
+        if sig in body:
+            return True
     user = comment.get('user') or {}
     login = (user.get('login') or '').lower()
     for bot_login in BOT_GITHUB_LOGINS:
